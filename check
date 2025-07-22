@@ -14,14 +14,15 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 import openai
 import gradio as gr
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 import time
 import dns.resolver
-from dateutil import parser  # For parsing domain creation date
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from dateutil import parser
 
 # -------------------------------
-# ENV SETUP
+# ENVIRONMENT SETUP
 # -------------------------------
 
 load_dotenv(override=True)
@@ -29,7 +30,7 @@ api_key = os.getenv("OPENAI_API_KEY")
 client = openai.OpenAI(api_key=api_key)
 
 # -------------------------------
-# MAIN CLASS
+# WEBSITE SUMMARIZER CLASS
 # -------------------------------
 
 class WebsiteSummarizer:
@@ -50,8 +51,7 @@ class WebsiteSummarizer:
             html = driver.page_source
             driver.quit()
             return html
-        except Exception as e:
-            print(f"[HTML Fetch Error]: {e}")
+        except:
             return None
 
     def check_ssl(self, url):
@@ -60,7 +60,7 @@ class WebsiteSummarizer:
             context = ssl.create_default_context()
             with socket.create_connection((parsed_url.hostname, 443), timeout=5) as sock:
                 with context.wrap_socket(sock, server_hostname=parsed_url.hostname) as ssock:
-                    ssock.getpeercert()
+                    cert = ssock.getpeercert()
             return True
         except:
             return False
@@ -70,24 +70,24 @@ class WebsiteSummarizer:
             domain = urlparse(url).netloc or urlparse(url).hostname
             if domain.startswith("www."):
                 domain = domain[4:]
+
             w = whois.whois(domain)
             creation = w.creation_date
-
             if isinstance(creation, list):
-                creation = [c for c in creation if c]
-                creation = creation[0] if creation else None
-
+                creation = [c for c in creation if c is not None]
+                if creation:
+                    creation = creation[0]
+                else:
+                    return 0
             if isinstance(creation, str):
                 creation = parser.parse(creation)
-
             if not isinstance(creation, datetime):
                 return 0
 
             now = datetime.now(creation.tzinfo) if creation.tzinfo else datetime.now()
             age_months = (now.year - creation.year) * 12 + (now.month - creation.month)
             return max(0, age_months)
-        except Exception as e:
-            print(f"[Domain Age ERROR] for {url}: {e}")
+        except:
             return 0
 
     def is_url_suspicious(self, url):
@@ -115,9 +115,12 @@ class WebsiteSummarizer:
             r = requests.head(url, timeout=5)
             headers = r.headers
             missing = []
-            for header in ['X-Content-Type-Options', 'Strict-Transport-Security', 'Content-Security-Policy']:
-                if header not in headers:
-                    missing.append(header)
+            if 'X-Content-Type-Options' not in headers:
+                missing.append('X-Content-Type-Options')
+            if 'Strict-Transport-Security' not in headers:
+                missing.append('Strict-Transport-Security')
+            if 'Content-Security-Policy' not in headers:
+                missing.append('Content-Security-Policy')
             return missing
         except:
             return ['All headers missing or unreachable']
@@ -137,13 +140,12 @@ class WebsiteSummarizer:
             action = form.get('action')
             if action and not action.startswith('https'):
                 suspicious_forms += 1
-            if any(field.get('name') in ['card', 'cc', 'cvv', 'password']
-                   for field in form.find_all(['input', 'textarea'])):
+            if any(field.get('name') in ['card', 'cc', 'cvv', 'password'] for field in form.find_all(['input', 'textarea'])):
                 suspicious_forms += 1
         return suspicious_forms
 
-    def check_minimal_content(self, html):
-        soup = BeautifulSoup(html, 'html.parser')
+    def check_minimal_content(self, html_content):
+        soup = BeautifulSoup(html_content, 'html.parser')
         text = soup.get_text(separator=' ', strip=True)
         return len(text.split()) < 50
 
@@ -152,7 +154,7 @@ class WebsiteSummarizer:
 
     def analyze_content_with_ai(self, text):
         prompt = f"""
-Analyze this website content and determine if it shows signs of being a scam or phishing website.
+Analyze this website content and determine if it shows signs of being a scam or phishing website. 
 Flag if there is urgency, login prompts, or poor grammar. Answer just 'safe', 'suspicious', or 'fraudulent'.
 
 Content:
@@ -172,25 +174,25 @@ Content:
         except:
             return "safe"
 
-    def check_dns_validation(self, url):
+    def check_dns_valid(self, url):
         try:
-            domain = urlparse(url).hostname
+            domain = urlparse(url).netloc or urlparse(url).hostname
             dns.resolver.resolve(domain, 'A')
             return True
         except:
             return False
 
-    def check_js_behavior(self, html):
-        suspicious_keywords = ['eval(', 'document.write', 'setInterval(', 'setTimeout(', 'window.location']
-        return any(keyword in html for keyword in suspicious_keywords)
+    def check_javascript_behavior(self, html):
+        # Simulate JavaScript warning (placeholder: flag if "onclick" or "window.location" exists)
+        return bool(re.search(r'onclick|window\.location|eval\(', html))
 
-    def check_virustotal_trivy(self, url):
-        return "No match found (placeholder)"  # Integration pending
+    def check_virustotal_or_trivy(self, url):
+        return "No match found (placeholder)"
 
     def summarize(self, url):
         html = self.fetch_html_selenium(url)
         if not html:
-            return f"❌ Failed to fetch website: {url}", "❌ Website does not exist or is unreachable."
+            return "❌ Failed to fetch website or website does not exist", "🚨 Website does not exist or has no retrievable content."
 
         soup = BeautifulSoup(html, 'html.parser')
         text = soup.get_text(separator=' ', strip=True)
@@ -202,15 +204,13 @@ Content:
                 messages=[{"role": "user", "content": f"Summarize the following website content:\n\n{trimmed_text}"}]
             )
             summary = chat_response.choices[0].message.content.strip()
-        except Exception as e:
-            summary = f"❌ OpenAI API error: {e}"
+        except:
+            return "❌ Unable to summarize content", "🚨 Website could not be summarized."
 
-        # ------------------------------------
+        # ---------------------
         # FRAUD CHECKS
-        # ------------------------------------
+        # ---------------------
         score = 0
-        issues = []
-
         ssl_valid = self.check_ssl(url)
         domain_age = self.check_domain_age(url)
         suspicious_url = self.is_url_suspicious(url)
@@ -219,12 +219,13 @@ Content:
         header_issues = self.check_security_headers(url)
         hotlinking = self.check_for_hotlinked_resources(soup)
         form_score = self.check_forms(soup, url)
-        minimal_content = self.check_minimal_content(html)
         content_status = self.analyze_content_with_ai(trimmed_text)
-        dns_valid = self.check_dns_validation(url)
-        js_flag = self.check_js_behavior(html)
-        vt_result = self.check_virustotal_trivy(url)
+        minimal_content = self.check_minimal_content(html)
+        dns_valid = self.check_dns_valid(url)
+        js_behavior = self.check_javascript_behavior(html)
+        virustotal_scan = self.check_virustotal_or_trivy(url)
 
+        # SCORING
         if ssl_valid: score += 1
         if domain_age > 6: score += 1
         if not suspicious_url: score += 1
@@ -235,33 +236,31 @@ Content:
         if form_score == 0: score += 1
         if len(header_issues) <= 1: score += 1
         if dns_valid: score += 1
-        if minimal_content:
-            issues.append("Page has very little visible content.")
-            score -= 1
+        if minimal_content: score -= 1
 
         verdict = "Likely Safe ✅" if score >= 7 else "Suspicious ⚠️" if score >= 4 else "Likely Fraudulent ❌"
 
         report = f"""
 ### 🔍 Fraud Check Report
+SSL Valid: {ssl_valid}  
+Domain Age: {domain_age} months  
+Suspicious URL Pattern: {suspicious_url}  
+Redirects >= 3: {redirections}  
+Blacklisted: {blacklist_flag}  
+Content Classification: {content_status}  
+Hotlinked Resources: {hotlinking}  
+Suspicious Forms Detected: {form_score}  
+Missing Headers: {", ".join(header_issues)}  
+DNS Valid: {dns_valid}  
+JS Behavior Suspicious: {js_behavior}  
+Minimal Content: {minimal_content}  
+VirusTotal/Trivy Scan: {virustotal_scan}
 
-**SSL Valid:** {ssl_valid}  
-**Domain Age:** {domain_age} months  
-**Suspicious URL Pattern:** {suspicious_url}  
-**Redirects >= 3:** {redirections}  
-**Blacklisted:** {blacklist_flag}  
-**Content Classification:** {content_status}  
-**Hotlinked Resources:** {hotlinking}  
-**Suspicious Forms Detected:** {form_score}  
-**Missing Headers:** {", ".join(header_issues)}  
-**DNS Valid:** {dns_valid}  
-**JS Behavior Suspicious:** {js_flag}  
-**Minimal Content:** {minimal_content}  
-**VirusTotal/Trivy Scan:** {vt_result}  
-
-**🛡 Final Score:** {score}/11  
-**🚦 Verdict:** **{verdict}**
+🛡 Final Score: {score}/11  
+🚦 Verdict: **{verdict}**
 """
         return summary, report
+
 
 # -------------------------------
 # GRADIO INTERFACE
@@ -277,30 +276,7 @@ iface = gr.Interface(
         gr.Markdown(label="🔍 Fraud Analysis Report")
     ],
     title="🌐 Website Summary & Fraud Checker",
-    description="Enter a website URL to generate a summary using GPT and scan for DNS, SSL, JS, and fraud indicators."
+    description="Enter a website URL to summarize and detect possible fraud indicators including SSL, domain age, DNS, JS behavior, minimal content, and more."
 )
 
 iface.launch()
-
-
-
-
-
-
-🔍 Fraud Check Report
-SSL Valid: True
-Domain Age: 0 months
-Suspicious URL Pattern: False
-Redirects >= 3: False
-Blacklisted: False
-Content Classification: safe
-Hotlinked Resources: False
-Suspicious Forms Detected: 0
-Missing Headers: X-Content-Type-Options, Strict-Transport-Security, Content-Security-Policy
-DNS Valid: True
-JS Behavior Suspicious: False
-Minimal Content: True
-VirusTotal/Trivy Scan: No match found (placeholder)
-
-🛡 Final Score: 8/11
-🚦 Verdict: Likely Safe ✅
