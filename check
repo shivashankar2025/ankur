@@ -23,7 +23,8 @@ import gradio as gr
 load_dotenv(override=True)
 api_key = os.getenv('OPENAI_API_KEY')
 
-openai = openai.OpenAI(api_key=api_key)
+# OpenAI client init (correct usage)
+openai_client = openai.OpenAI(api_key=api_key)
 
 # -------------------------------
 # WEBSITE ANALYZER CLASS
@@ -34,7 +35,7 @@ class WebsiteSummarizer:
         if api_key:
             self.client = openai.OpenAI(api_key=api_key)
         else:
-            self.client = openai.OpenAI()
+            self.client = openai_client
         self.model = model
 
     def check_ssl(self, url):
@@ -117,8 +118,7 @@ class WebsiteSummarizer:
         return suspicious_forms
 
     def check_blacklists(self, url):
-        # Placeholder (you can integrate VirusTotal, PhishTank etc.)
-        # For now, just simulate as safe
+        # Placeholder for future blacklist integrations
         return False
 
     def analyze_content_with_ai(self, text):
@@ -145,7 +145,10 @@ Content:
 
     def summarize(self, url):
         try:
-            response = requests.get(url, timeout=10)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            }
+            response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
         except requests.RequestException as e:
             return f"❌ Failed to fetch website: {e}", ""
@@ -215,7 +218,6 @@ Content:
 **🛡 Final Score:** {score}/10  
 **🚦 Verdict:** **{verdict}**
 """
-
         return summary, report
 
 # -------------------------------
@@ -237,4 +239,4 @@ iface = gr.Interface(
 
 iface.launch()
 
-ssl route, self signed standard certifcate only.
+# NOTE: SSL is used with a standard self-signed certificate only.
