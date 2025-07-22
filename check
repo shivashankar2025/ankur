@@ -281,3 +281,26 @@ iface = gr.Interface(
 )
 
 iface.launch()
+
+
+
+
+
+
+🔍 Fraud Check Report
+SSL Valid: True
+Domain Age: 0 months
+Suspicious URL Pattern: False
+Redirects >= 3: False
+Blacklisted: False
+Content Classification: safe
+Hotlinked Resources: False
+Suspicious Forms Detected: 0
+Missing Headers: X-Content-Type-Options, Strict-Transport-Security, Content-Security-Policy
+DNS Valid: True
+JS Behavior Suspicious: False
+Minimal Content: True
+VirusTotal/Trivy Scan: No match found (placeholder)
+
+🛡 Final Score: 8/11
+🚦 Verdict: Likely Safe ✅
