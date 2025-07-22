@@ -8,17 +8,18 @@ import ssl
 import socket
 import whois
 import requests
+import tldextract
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 import openai
 import gradio as gr
+from dateutil import parser
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 import time
-from dateutil import parser
 
 # -------------------------------
 # ENVIRONMENT SETUP
@@ -66,9 +67,8 @@ class WebsiteSummarizer:
 
     def check_domain_age(self, url):
         try:
-            domain = urlparse(url).netloc or urlparse(url).hostname
-            if domain.startswith("www."):
-                domain = domain[4:]
+            extracted = tldextract.extract(url)
+            domain = f"{extracted.domain}.{extracted.suffix}"
 
             w = whois.whois(domain)
             creation = w.creation_date
@@ -86,7 +86,7 @@ class WebsiteSummarizer:
             if not isinstance(creation, datetime):
                 return 0
 
-            now = datetime.now(creation.tzinfo) if creation.tzinfo else datetime.now()
+            now = datetime.now(creation.tzinfo) if creation.tzinfo else datetime.utcnow()
             age_months = (now.year - creation.year) * 12 + (now.month - creation.month)
             return max(0, age_months)
 
@@ -197,13 +197,7 @@ Content:
         except Exception as e:
             summary = f"❌ OpenAI API error: {e}"
 
-        # ---------------------
-        # FRAUD CHECKS
-        # ---------------------
-
         score = 0
-        issues = []
-
         ssl_valid = self.check_ssl(url)
         domain_age = self.check_domain_age(url)
         suspicious_url = self.is_url_suspicious(url)
@@ -213,7 +207,7 @@ Content:
         hotlinking = self.check_for_hotlinked_resources(soup)
         form_score = self.check_forms(soup, url)
         content_status = self.analyze_content_with_ai(trimmed_text)
-        minimal_content = self.check_minimal_content(html)
+        minimal_content_flag = self.check_minimal_content(html)
 
         if ssl_valid: score += 1
         if domain_age > 6: score += 1
@@ -224,8 +218,7 @@ Content:
         if not hotlinking: score += 1
         if form_score == 0: score += 1
         if len(header_issues) <= 1: score += 1
-        if minimal_content:
-            issues.append("Page has very little visible content.")
+        if minimal_content_flag:
             score -= 1
 
         verdict = "Likely Safe ✅" if score >= 6 else "Suspicious ⚠️" if score >= 3 else "Likely Fraudulent ❌"
@@ -242,8 +235,7 @@ Content:
 **Hotlinked Resources:** {hotlinking}  
 **Suspicious Forms Detected:** {form_score}  
 **Missing Headers:** {", ".join(header_issues)}  
-**Minimal Content:** {minimal_content}  
-**Notes:** {', '.join(issues) if issues else 'None'}
+**Minimal Content Warning:** {'Yes' if minimal_content_flag else 'No'}
 
 **🛡 Final Score:** {score}/10  
 **🚦 Verdict:** **{verdict}**
