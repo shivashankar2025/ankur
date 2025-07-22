@@ -18,8 +18,7 @@ import gradio as gr
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 import time
-
-from dateutil import parser  # Needed for updated check_domain_age
+from dateutil import parser
 
 # -------------------------------
 # ENVIRONMENT SETUP
@@ -47,7 +46,7 @@ class WebsiteSummarizer:
             options.add_argument("--disable-dev-shm-usage")
             driver = webdriver.Chrome(options=options)
             driver.get(url)
-            time.sleep(5)  # wait for JS to load
+            time.sleep(5)
             html = driver.page_source
             driver.quit()
             return html
@@ -60,7 +59,7 @@ class WebsiteSummarizer:
             context = ssl.create_default_context()
             with socket.create_connection((parsed_url.hostname, 443), timeout=5) as sock:
                 with context.wrap_socket(sock, server_hostname=parsed_url.hostname) as ssock:
-                    cert = ssock.getpeercert()
+                    ssock.getpeercert()
             return True
         except:
             return False
@@ -74,7 +73,6 @@ class WebsiteSummarizer:
             w = whois.whois(domain)
             creation = w.creation_date
 
-            # Handle case when creation_date is a list
             if isinstance(creation, list):
                 creation = [c for c in creation if c is not None]
                 if creation:
@@ -82,7 +80,6 @@ class WebsiteSummarizer:
                 else:
                     return 0
 
-            # Parse string format if needed
             if isinstance(creation, str):
                 creation = parser.parse(creation)
 
@@ -176,6 +173,12 @@ Content:
         except:
             return "safe"
 
+    def check_minimal_content(self, html_content):
+        soup = BeautifulSoup(html_content, 'html.parser')
+        text = soup.get_text(separator=' ', strip=True)
+        word_count = len(text.split())
+        return word_count < 50
+
     def summarize(self, url):
         html = self.fetch_html_selenium(url)
         if not html:
@@ -199,6 +202,8 @@ Content:
         # ---------------------
 
         score = 0
+        issues = []
+
         ssl_valid = self.check_ssl(url)
         domain_age = self.check_domain_age(url)
         suspicious_url = self.is_url_suspicious(url)
@@ -208,6 +213,7 @@ Content:
         hotlinking = self.check_for_hotlinked_resources(soup)
         form_score = self.check_forms(soup, url)
         content_status = self.analyze_content_with_ai(trimmed_text)
+        minimal_content = self.check_minimal_content(html)
 
         if ssl_valid: score += 1
         if domain_age > 6: score += 1
@@ -218,6 +224,9 @@ Content:
         if not hotlinking: score += 1
         if form_score == 0: score += 1
         if len(header_issues) <= 1: score += 1
+        if minimal_content:
+            issues.append("Page has very little visible content.")
+            score -= 1
 
         verdict = "Likely Safe ✅" if score >= 6 else "Suspicious ⚠️" if score >= 3 else "Likely Fraudulent ❌"
 
@@ -233,6 +242,8 @@ Content:
 **Hotlinked Resources:** {hotlinking}  
 **Suspicious Forms Detected:** {form_score}  
 **Missing Headers:** {", ".join(header_issues)}  
+**Minimal Content:** {minimal_content}  
+**Notes:** {', '.join(issues) if issues else 'None'}
 
 **🛡 Final Score:** {score}/10  
 **🚦 Verdict:** **{verdict}**
