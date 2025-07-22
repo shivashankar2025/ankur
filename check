@@ -1,239 +1,145 @@
-# -------------------------------
-# IMPORTS
-# -------------------------------
-
-import os
-import re
-import ssl
-import socket
-import whois
 import requests
+import whois
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urlparse
-from dotenv import load_dotenv
-import openai
-import gradio as gr
-
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-import time
+import socket
+import ssl
+import re
 
-# -------------------------------
-# ENVIRONMENT SETUP
-# -------------------------------
+class WebsiteAnalyzer:
+    def __init__(self, url):
+        self.url = url if url.startswith("http") else "http://" + url
+        self.domain = urlparse(self.url).netloc
+        self.score = 10
+        self.issues = []
+        self.html = ""
 
-load_dotenv(override=True)
-api_key = os.getenv("OPENAI_API_KEY")
-client = openai.OpenAI(api_key=api_key)
-
-# -------------------------------
-# WEBSITE SUMMARIZER CLASS
-# -------------------------------
-
-class WebsiteSummarizer:
-    def __init__(self, model="gpt-4o"):
-        self.client = client
-        self.model = model
-
-    def fetch_html_selenium(self, url):
+    def fetch_content(self):
         try:
-            options = Options()
-            options.add_argument("--headless=new")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            driver = webdriver.Chrome(options=options)
-            driver.get(url)
-            time.sleep(5)  # wait for JS to load
-            html = driver.page_source
-            driver.quit()
-            return html
-        except Exception as e:
-            return None
+            # Try normal requests first
+            res = requests.get(self.url, timeout=10)
+            res.raise_for_status()
+            self.html = res.text
+        except:
+            # Fallback to headless browser
+            try:
+                chrome_options = Options()
+                chrome_options.add_argument("--headless")
+                chrome_options.add_argument("--disable-gpu")
+                driver = webdriver.Chrome(options=chrome_options)
+                driver.get(self.url)
+                self.html = driver.page_source
+                driver.quit()
+            except Exception as e:
+                self.issues.append(f"Failed to fetch website content: {e}")
+                self.score -= 2
+                return
 
-    def check_ssl(self, url):
+    def check_ssl(self):
         try:
-            parsed_url = urlparse(url)
-            context = ssl.create_default_context()
-            with socket.create_connection((parsed_url.hostname, 443), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=parsed_url.hostname) as ssock:
-                    cert = ssock.getpeercert()
+            ctx = ssl.create_default_context()
+            with ctx.wrap_socket(socket.socket(), server_hostname=self.domain) as s:
+                s.settimeout(3)
+                s.connect((self.domain, 443))
             return True
         except:
+            self.issues.append("SSL certificate invalid or missing.")
+            self.score -= 1
             return False
 
-    def check_domain_age(self, url):
+    def get_domain_age(self):
         try:
-            domain = urlparse(url).hostname
-            whois_info = whois.whois(domain)
-            creation_date = whois_info.creation_date
-            if isinstance(creation_date, list):
-                creation_date = creation_date[0]
-            if not creation_date:
-                return 0
-            age_in_months = (datetime.now() - creation_date).days // 30
-            return age_in_months
+            info = whois.whois(self.domain)
+            if isinstance(info.creation_date, list):
+                created = info.creation_date[0]
+            else:
+                created = info.creation_date
+
+            if not created:
+                raise ValueError("WHOIS data incomplete.")
+            age_days = (datetime.now() - created).days
+            if age_days < 180:
+                self.issues.append(f"Domain is too new: {age_days} days old.")
+                self.score -= 1
+            return age_days
+        except Exception:
+            self.issues.append("Domain age could not be determined.")
+            self.score -= 1
+            return None
+
+    def check_redirects(self):
+        try:
+            r = requests.get(self.url, timeout=10, allow_redirects=True)
+            if len(r.history) >= 3:
+                self.issues.append(f"Too many redirects: {len(r.history)}")
+                self.score -= 1
         except:
-            return 0
+            self.issues.append("Could not verify redirects.")
+            self.score -= 1
 
-    def is_url_suspicious(self, url):
-        parsed = urlparse(url)
-        suspicious = 0
-        if re.match(r"\d{1,3}(\.\d{1,3}){3}", parsed.hostname or ""):
-            suspicious += 1
-        if re.search(r"(login|verify|secure|update)", parsed.hostname or ""):
-            suspicious += 1
-        if parsed.hostname and parsed.hostname.count('.') > 3:
-            suspicious += 1
-        if len(url) > 75:
-            suspicious += 1
-        return suspicious >= 2
-
-    def check_redirects(self, url):
+    def check_security_headers(self):
         try:
-            r = requests.get(url, allow_redirects=True, timeout=5)
-            return len(r.history) >= 3
-        except:
-            return False
-
-    def check_security_headers(self, url):
-        try:
-            r = requests.head(url, timeout=5)
-            headers = r.headers
+            r = requests.get(self.url, timeout=10)
             missing = []
-            if 'X-Content-Type-Options' not in headers:
-                missing.append('X-Content-Type-Options')
-            if 'Strict-Transport-Security' not in headers:
-                missing.append('Strict-Transport-Security')
-            if 'Content-Security-Policy' not in headers:
-                missing.append('Content-Security-Policy')
-            return missing
+            required = ["X-Content-Type-Options", "X-Frame-Options", "Content-Security-Policy", "Strict-Transport-Security"]
+            for header in required:
+                if header not in r.headers:
+                    missing.append(header)
+            if missing:
+                self.issues.append(f"Missing security headers: {', '.join(missing)}")
+                self.score -= 1
         except:
-            return ['All headers missing or unreachable']
+            self.issues.append("Could not verify headers.")
+            self.score -= 1
 
-    def check_for_hotlinked_resources(self, soup):
-        hotlinks = 0
-        for tag in soup.find_all(['img', 'link']):
-            src = tag.get('src') or tag.get('href')
-            if src and any(trusted in src for trusted in ['google.com', 'facebook.com', 'microsoft.com']):
-                hotlinks += 1
-        return hotlinks > 2
+    def check_minimal_content(self):
+        soup = BeautifulSoup(self.html, "html.parser")
+        text = soup.get_text(separator=" ", strip=True)
+        word_count = len(text.split())
+        if word_count < 50:
+            self.issues.append("Page has very little visible content.")
+            self.score -= 1
 
-    def check_forms(self, soup, url):
-        forms = soup.find_all('form')
-        suspicious_forms = 0
-        for form in forms:
-            action = form.get('action')
-            if action and not action.startswith('https'):
-                suspicious_forms += 1
-            if any(field.get('name') in ['card', 'cc', 'cvv', 'password'] for field in form.find_all(['input', 'textarea'])):
-                suspicious_forms += 1
-        return suspicious_forms
+    def check_suspicious_url(self):
+        if re.search(r"(free|login|bonus|update|gift|win)", self.url, re.IGNORECASE):
+            self.issues.append("URL contains suspicious keywords.")
+            self.score -= 1
 
-    def check_blacklists(self, url):
-        return False  # Placeholder
+    def check_forms(self):
+        soup = BeautifulSoup(self.html, "html.parser")
+        forms = soup.find_all("form")
+        if forms:
+            self.issues.append(f"{len(forms)} form(s) detected on the site.")
+            # Not necessarily a deduction
 
-    def analyze_content_with_ai(self, text):
-        prompt = f"""
-Analyze this website content and determine if it shows signs of being a scam or phishing website. 
-Flag if there is urgency, login prompts, or poor grammar. Answer just 'safe', 'suspicious', or 'fraudulent'.
+    def analyze(self):
+        print(f"\n🔍 Analyzing: {self.url}\n")
+        self.fetch_content()
+        if not self.html:
+            print("❌ Could not analyze website. Skipping.")
+            return
 
-Content:
-{text[:2000]}
-"""
-        try:
-            result = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            decision = result.choices[0].message.content.lower()
-            if "fraud" in decision:
-                return "fraudulent"
-            elif "suspicious" in decision:
-                return "suspicious"
-            return "safe"
-        except:
-            return "safe"
+        self.check_ssl()
+        self.get_domain_age()
+        self.check_redirects()
+        self.check_security_headers()
+        self.check_minimal_content()
+        self.check_suspicious_url()
+        self.check_forms()
 
-    def summarize(self, url):
-        html = self.fetch_html_selenium(url)
-        if not html:
-            return f"❌ Failed to fetch website: {url}", ""
+        print(f"\n✅ Final Score: {self.score}/10")
+        if self.issues:
+            print("\n⚠️ Issues Found:")
+            for issue in self.issues:
+                print(" -", issue)
+        else:
+            print("✅ No issues found.")
 
-        soup = BeautifulSoup(html, 'html.parser')
-        text = soup.get_text(separator=' ', strip=True)
-        trimmed_text = text[:4000]
-
-        try:
-            chat_response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": f"Summarize the following website content:\n\n{trimmed_text}"}]
-            )
-            summary = chat_response.choices[0].message.content.strip()
-        except Exception as e:
-            summary = f"❌ OpenAI API error: {e}"
-
-        # ---------------------
-        # FRAUD CHECKS
-        # ---------------------
-
-        score = 0
-        ssl_valid = self.check_ssl(url)
-        domain_age = self.check_domain_age(url)
-        suspicious_url = self.is_url_suspicious(url)
-        redirections = self.check_redirects(url)
-        blacklist_flag = self.check_blacklists(url)
-        header_issues = self.check_security_headers(url)
-        hotlinking = self.check_for_hotlinked_resources(soup)
-        form_score = self.check_forms(soup, url)
-        content_status = self.analyze_content_with_ai(trimmed_text)
-
-        if ssl_valid: score += 1
-        if domain_age > 6: score += 1
-        if not suspicious_url: score += 1
-        if not redirections: score += 1
-        if not blacklist_flag: score += 2
-        if content_status == "safe": score += 2
-        if not hotlinking: score += 1
-        if form_score == 0: score += 1
-        if len(header_issues) <= 1: score += 1
-
-        verdict = "Likely Safe ✅" if score >= 6 else "Suspicious ⚠️" if score >= 3 else "Likely Fraudulent ❌"
-
-        report = f"""
-### 🔍 Fraud Check Report
-
-**SSL Valid:** {ssl_valid}  
-**Domain Age:** {domain_age} months  
-**Suspicious URL Pattern:** {suspicious_url}  
-**Redirects >= 3:** {redirections}  
-**Blacklisted:** {blacklist_flag}  
-**Content Classification:** {content_status}  
-**Hotlinked Resources:** {hotlinking}  
-**Suspicious Forms Detected:** {form_score}  
-**Missing Headers:** {", ".join(header_issues)}  
-
-**🛡 Final Score:** {score}/10  
-**🚦 Verdict:** **{verdict}**
-"""
-        return summary, report
-
-# -------------------------------
-# GRADIO INTERFACE
-# -------------------------------
-
-summarizer = WebsiteSummarizer()
-
-iface = gr.Interface(
-    fn=summarizer.summarize,
-    inputs=gr.Textbox(label="Website URL"),
-    outputs=[
-        gr.Markdown(label="📝 Website Summary"),
-        gr.Markdown(label="🔍 Fraud Analysis Report")
-    ],
-    title="🌐 Website Summary & Fraud Checker",
-    description="Enter a website URL to generate a summary using GPT and scan for common fraud indicators."
-)
-
-iface.launch()
+# Example usage
+if __name__ == "__main__":
+    url = input("Enter website URL to analyze: ")
+    analyzer = WebsiteAnalyzer(url)
+    analyzer.analyze()
