@@ -1,7 +1,3 @@
-# -------------------------------
-# IMPORTS
-# -------------------------------
-
 import os
 import re
 import ssl
@@ -92,16 +88,16 @@ class WebsiteSummarizer:
 
     def is_url_suspicious(self, url):
         parsed = urlparse(url)
-        suspicious = 0
+        suspicious_indicators = 0
         if re.match(r"\d{1,3}(\.\d{1,3}){3}", parsed.hostname or ""):
-            suspicious += 1
+            suspicious_indicators += 1
         if re.search(r"(login|verify|secure|update)", parsed.hostname or ""):
-            suspicious += 1
+            suspicious_indicators += 1
         if parsed.hostname and parsed.hostname.count('.') > 3:
-            suspicious += 1
+            suspicious_indicators += 1
         if len(url) > 75:
-            suspicious += 1
-        return suspicious >= 2
+            suspicious_indicators += 1
+        return suspicious_indicators >= 2
 
     def check_redirects(self, url):
         try:
@@ -153,8 +149,11 @@ class WebsiteSummarizer:
         return False  # Placeholder
 
     def analyze_content_with_ai(self, text):
+        if not text or len(text.split()) < 20: # Consider "no content" if very little text
+            return "no content to analyze"
+
         prompt = f"""
-Analyze this website content and determine if it shows signs of being a scam or phishing website. 
+Analyze this website content and determine if it shows signs of being a scam or phishing website.
 Flag if there is urgency, login prompts, or poor grammar. Answer just 'safe', 'suspicious', or 'fraudulent'.
 
 Content:
@@ -172,7 +171,7 @@ Content:
                 return "suspicious"
             return "safe"
         except:
-            return "safe"
+            return "safe" # Default to safe if AI analysis fails
 
     def check_dns_valid(self, url):
         try:
@@ -183,8 +182,8 @@ Content:
             return False
 
     def check_javascript_behavior(self, html):
-        # Simulate JavaScript warning (placeholder: flag if "onclick" or "window.location" exists)
-        return bool(re.search(r'onclick|window\.location|eval\(', html))
+        # Simulate JavaScript warning (flag if "onclick" or "window.location" exists or suspicious eval/document.write)
+        return bool(re.search(r'onclick|window\.location|eval\(|document\.write\(', html, re.IGNORECASE))
 
     def check_virustotal_or_trivy(self, url):
         return "No match found (placeholder)"
@@ -205,58 +204,123 @@ Content:
             )
             summary = chat_response.choices[0].message.content.strip()
         except:
-            return "❌ Unable to summarize content", "🚨 Website could not be summarized."
+            summary = "❌ Unable to summarize content"
 
         # ---------------------
         # FRAUD CHECKS
         # ---------------------
         score = 0
+        
         ssl_valid = self.check_ssl(url)
         domain_age = self.check_domain_age(url)
         suspicious_url = self.is_url_suspicious(url)
         redirections = self.check_redirects(url)
         blacklist_flag = self.check_blacklists(url)
-        header_issues = self.check_security_headers(url)
+        
+        # Determine content_status based on actual content or if minimal
+        if self.check_minimal_content(html):
+            content_status = "no content to analyze"
+        else:
+            content_status = self.analyze_content_with_ai(trimmed_text)
+
         hotlinking = self.check_for_hotlinked_resources(soup)
         form_score = self.check_forms(soup, url)
-        content_status = self.analyze_content_with_ai(trimmed_text)
-        minimal_content = self.check_minimal_content(html)
+        header_issues = self.check_security_headers(url)
         dns_valid = self.check_dns_valid(url)
         js_behavior = self.check_javascript_behavior(html)
+        minimal_content = self.check_minimal_content(html) # Recalculate if needed, or use the one from content_status check
         virustotal_scan = self.check_virustotal_or_trivy(url)
 
-        # SCORING
+        # SCORING - Adjusted for stricter fraud detection and to match your desired output
+        
+        # SSL Valid: +1 if True
         if ssl_valid: score += 1
-        if domain_age > 6: score += 1
-        if not suspicious_url: score += 1
-        if not redirections: score += 1
-        if not blacklist_flag: score += 1
-        if content_status == "safe": score += 2
-        if not hotlinking: score += 1
-        if form_score == 0: score += 1
-        if len(header_issues) <= 1: score += 1
-        if dns_valid: score += 1
-        if minimal_content: score -= 1
+        ssl_status = "✅ True" if ssl_valid else "❌ False"
 
-        verdict = "Likely Safe ✅" if score >= 7 else "Suspicious ⚠️" if score >= 4 else "Likely Fraudulent ❌"
+        # Domain Age: +1 if > 6 months
+        if domain_age > 6: score += 1
+        domain_age_status = f"✅ {domain_age} months" if domain_age > 6 else f"⚠️ {domain_age} months"
+
+        # Suspicious URL Pattern: +1 if False
+        if not suspicious_url: score += 1
+        suspicious_url_status = "❌ True" if suspicious_url else "✅ False"
+
+        # Redirects >= 3: +1 if False
+        if not redirections: score += 1
+        redirects_status = "❌ True" if redirections else "✅ False"
+
+        # Blacklisted: +1 if False
+        if not blacklist_flag: score += 1
+        blacklist_status = "❌ True" if blacklist_flag else "✅ False"
+
+        # Content Classification: +2 if "safe", -1 if "suspicious", -2 if "fraudulent" or "no content"
+        if content_status == "safe": 
+            score += 2
+            content_classification_status = "✅ safe"
+        elif content_status == "suspicious":
+            score -= 1
+            content_classification_status = "⚠️ suspicious"
+        elif content_status == "fraudulent":
+            score -= 2
+            content_classification_status = "❌ fraudulent"
+        else: # "no content to analyze"
+            score -= 2
+            content_classification_status = "❌ (no content to analyze)"
+
+        # Hotlinked Resources: +1 if False
+        if not hotlinking: score += 1
+        hotlinking_status = "❌ True" if hotlinking else "✅ False"
+
+        # Suspicious Forms Detected: +1 if 0
+        if form_score == 0: score += 1
+        form_status = "✅ 0" if form_score == 0 else f"❌ {form_score}"
+
+        # Missing Headers: +1 if <= 1 (meaning 0 or 1 missing)
+        if len(header_issues) <= 1: score += 1
+        header_status = f"✅ {', '.join(header_issues) if header_issues else 'None'}" if len(header_issues) <=1 else f"❌ {', '.join(header_issues)}"
+
+        # DNS Valid: +1 if True
+        if dns_valid: score += 1
+        dns_status = "✅ True" if dns_valid else "❌ False"
+        
+        # JS Behavior Suspicious: +1 if False
+        if not js_behavior: score +=1
+        js_behavior_status = "❌ True" if js_behavior else "✅ False"
+
+        # Minimal Content: -1 if True (already handled by content_status, but for display)
+        # If minimal content is true, it contributes negatively. This is already factored into content_status.
+        # However, for explicit display, we can show its status.
+        minimal_content_status = "❌ True" if minimal_content else "✅ False"
+
+        virustotal_scan_status = f"⚠️ {virustotal_scan}" # This is always a placeholder, so mark as warning
+
+        # Determine overall verdict
+        if score >= 7:
+            verdict = "Likely Safe ✅"
+        elif score >= 4:
+            verdict = "Suspicious ⚠️"
+        else:
+            verdict = "Likely Fraudulent ❌"
 
         report = f"""
 ### 🔍 Fraud Check Report
-SSL Valid: {ssl_valid}  
-Domain Age: {domain_age} months  
-Suspicious URL Pattern: {suspicious_url}  
-Redirects >= 3: {redirections}  
-Blacklisted: {blacklist_flag}  
-Content Classification: {content_status}  
-Hotlinked Resources: {hotlinking}  
-Suspicious Forms Detected: {form_score}  
-Missing Headers: {", ".join(header_issues)}  
-DNS Valid: {dns_valid}  
-JS Behavior Suspicious: {js_behavior}  
-Minimal Content: {minimal_content}  
-VirusTotal/Trivy Scan: {virustotal_scan}
+SSL Valid: {ssl_status}
+Domain Age: {domain_age_status}
+Suspicious URL Pattern: {suspicious_url_status}
+Redirects >= 3: {redirects_status}
+Blacklisted: {blacklist_status}
+Content Classification: {content_classification_status}
+Hotlinked Resources: {hotlinking_status}
+Suspicious Forms Detected: {form_status}
+Missing Headers: {header_status}
+DNS Valid: {dns_status}
+JS Behavior Suspicious: {js_behavior_status}
+Minimal Content: {minimal_content_status}
+VirusTotal/Trivy Scan: {virustotal_scan_status}
 
-🛡 Final Score: {score}/11  
+---
+
+🛡 Final Score: {score}/11
 🚦 Verdict: **{verdict}**
 """
         return summary, report
