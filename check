@@ -1,7 +1,3 @@
-# -------------------------------
-# IMPORTS
-# -------------------------------
-
 import os
 import re
 import ssl
@@ -10,83 +6,195 @@ import whois
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
-from urllib.parse import urlparse
-
+from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
 import openai
 import gradio as gr
+import time
+import dns.resolver
 
-# -------------------------------
-# ENVIRONMENT SETUP
-# -------------------------------
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from dateutil import parser
+from concurrent.futures import ThreadPoolExecutor
 
 # -------------------------------
 # ENVIRONMENT SETUP
 # -------------------------------
 
 load_dotenv(override=True)
-api_key = os.getenv('OPENAI_API_KEY')
+api_key = os.getenv("OPENAI_API_KEY")
 
+# Check if API key is loaded
+if not api_key:
+    raise ValueError("OPENAI_API_KEY environment variable not set.")
+
+client = openai.OpenAI(api_key=api_key)
 
 # -------------------------------
-# WEBSITE ANALYZER CLASS
+# WEBSITE SUMMARIZER CLASS
 # -------------------------------
 
 class WebsiteSummarizer:
-    def __init__(self, model="gpt-4o", api_key=None):
-        from openai import OpenAI
-        if api_key:
-            self.client = OpenAI(api_key=api_key)
-        else:
-            self.client = OpenAI()
+    def __init__(self, model="gpt-4o"):
+        self.client = client
         self.model = model
+        self.executor = ThreadPoolExecutor(max_workers=5) # For parallelizing some checks
+
+    def _normalize_url(self, url):
+        """Ensures URL has a scheme and a proper hostname."""
+        if not re.match(r'^[a-zA-Z]+://', url):
+            url = 'https://' + url # Default to HTTPS if no scheme specified
+        return url
+
+    def fetch_html_selenium(self, url):
+        """Fetches HTML content using Selenium for dynamic content."""
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--disable-browser-side-navigation")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--blink-settings=imagesEnabled=false") # Optimize: don't load images
+
+        driver = None
+        try:
+            driver = webdriver.Chrome(options=options)
+            driver.set_page_load_timeout(30) # Set a timeout for page load
+            driver.get(url)
+            time.sleep(5) # Allow some time for content to render
+            html = driver.page_source
+            return html
+        except Exception as e:
+            print(f"Selenium fetch error for {url}: {e}")
+            return None
+        finally:
+            if driver:
+                driver.quit()
 
     def check_ssl(self, url):
+        """Checks SSL certificate validity and existence for a given URL."""
+        parsed_url = urlparse(url)
+        hostname = parsed_url.hostname
+        if not hostname:
+            return False, "No hostname found"
+
+        # If the URL is HTTP, check if it redirects to HTTPS and then check SSL
+        if parsed_url.scheme == 'http':
+            try:
+                response = requests.head(url, allow_redirects=True, timeout=5)
+                final_url_scheme = urlparse(response.url).scheme
+                if final_url_scheme == 'https':
+                    url = response.url # Update URL to the final HTTPS one for the check
+                else:
+                    return False, "HTTP connection, no HTTPS redirect"
+            except requests.exceptions.RequestException:
+                return False, "Could not connect to HTTP URL or follow redirects"
+
         try:
-            parsed_url = urlparse(url)
             context = ssl.create_default_context()
-            with socket.create_connection((parsed_url.hostname, 443), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=parsed_url.hostname) as ssock:
+            with socket.create_connection((hostname, 443), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                     cert = ssock.getpeercert()
-            return True
-        except Exception:
-            return False
+                    # Optionally, add more checks like expiry, common name matching etc.
+                    # For simplicity, we just check if we got a cert.
+            return True, "Valid SSL/TLS certificate found"
+        except ssl.SSLError as e:
+            return False, f"SSL Error: {e}"
+        except socket.error as e:
+            return False, f"Socket Error (port 443 unreachable): {e}"
+        except Exception as e:
+            return False, f"General SSL check error: {e}"
 
     def check_domain_age(self, url):
+        """Checks the domain's creation date to determine its age."""
         try:
-            domain = urlparse(url).hostname
-            whois_info = whois.whois(domain)
-            creation_date = whois_info.creation_date
-            if isinstance(creation_date, list):
-                creation_date = creation_date[0]
-            if not creation_date:
-                return 0
-            age_in_months = (datetime.now() - creation_date).days // 30
-            return age_in_months
-        except:
-            return 0
+            domain = urlparse(url).netloc
+            if domain.startswith("www."):
+                domain = domain[4:]
+
+            # Attempt to resolve the effective TLD and domain
+            # This is a simplified approach, full TLD parsing is complex
+            parts = domain.split('.')
+            if len(parts) > 2: # e.g., sub.domain.co.uk -> domain.co.uk
+                domain_for_whois = ".".join(parts[-2:])
+                if len(parts[-1]) == 2 and len(parts[-2]) <= 3: # Handle co.uk, com.au etc.
+                    if len(parts) >= 3: # Ensure there's a preceding part for the effective domain
+                        domain_for_whois = ".".join(parts[-3:]) # e.g., example.co.uk
+            else:
+                domain_for_whois = domain
+
+            w = whois.whois(domain_for_whois)
+
+            creation = w.creation_date
+            if isinstance(creation, list):
+                creation = [c for c in creation if c is not None]
+                if creation:
+                    creation = creation[0]
+                else:
+                    return 0, "No creation date found in WHOIS"
+            
+            if isinstance(creation, str):
+                creation = parser.parse(creation)
+            
+            if not isinstance(creation, datetime):
+                return 0, "Invalid creation date format"
+
+            now = datetime.now(creation.tzinfo) if creation.tzinfo else datetime.now()
+            age_months = (now.year - creation.year) * 12 + (now.month - creation.month)
+            return max(0, age_months), f"{max(0, age_months)} months"
+        except whois.parser.PywhoisError as e:
+            return 0, f"WHOIS lookup failed: {e}"
+        except Exception as e:
+            return 0, f"Domain age check error: {e}"
 
     def is_url_suspicious(self, url):
+        """Analyzes the URL for suspicious patterns."""
         parsed = urlparse(url)
-        suspicious = 0
-        if re.match(r"\d{1,3}(\.\d{1,3}){3}", parsed.hostname or ""):
-            suspicious += 1
-        if re.search(r"(login|verify|secure|update)", parsed.hostname or ""):
-            suspicious += 1
+        suspicious_reasons = []
+
+        # 1. IP address in hostname
+        if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", parsed.hostname or ""):
+            suspicious_reasons.append("IP address used instead of domain name")
+        
+        # 2. Keywords in hostname
+        if re.search(r"(login|verify|secure|update|bank|paypal|account|webscr)", parsed.hostname or "", re.IGNORECASE):
+            suspicious_reasons.append("Suspicious keywords in hostname")
+        
+        # 3. Excessive subdomains (e.g., brand.com.malicious.site.xyz)
         if parsed.hostname and parsed.hostname.count('.') > 3:
-            suspicious += 1
+            suspicious_reasons.append("Excessive subdomains")
+        
+        # 4. Long URL
         if len(url) > 75:
-            suspicious += 1
-        return suspicious >= 2
+            suspicious_reasons.append("URL is unusually long")
+
+        # 5. Misleading subdomains/paths (e.g., google.com.malicious.site)
+        # Or legitimate domains nested in paths on other domains
+        # This is harder to generalize, but we can check if the path contains known legitimate domains
+        if parsed.path and any(k in parsed.path for k in ['google.com', 'youtube.com', 'facebook.com', 'paypal.com']) and \
+           not (parsed.hostname and any(k in parsed.hostname for k in ['google.com', 'youtube.com', 'facebook.com', 'paypal.com'])):
+            suspicious_reasons.append("Legitimate brand name in path of a different domain")
+
+        return len(suspicious_reasons) > 0, suspicious_reasons
 
     def check_redirects(self, url):
+        """Checks for excessive redirects."""
         try:
-            r = requests.get(url, allow_redirects=True, timeout=5)
-            return len(r.history) >= 3
-        except:
-            return False
+            r = requests.get(url, allow_redirects=True, timeout=10)
+            if len(r.history) >= 3:
+                return True, f"Excessive redirects ({len(r.history)} detected)"
+            return False, "Few or no redirects"
+        except requests.exceptions.RequestException as e:
+            return False, f"Redirect check failed: {e}"
 
     def check_security_headers(self, url):
+        """Checks for common missing security headers."""
         try:
             r = requests.head(url, timeout=5)
             headers = r.headers
@@ -97,109 +205,356 @@ class WebsiteSummarizer:
                 missing.append('Strict-Transport-Security')
             if 'Content-Security-Policy' not in headers:
                 missing.append('Content-Security-Policy')
-            return missing
-        except:
-            return ['All headers missing or unreachable']
+            if 'X-Frame-Options' not in headers: # Added X-Frame-Options
+                missing.append('X-Frame-Options')
+            return len(missing) > 0, missing
+        except requests.exceptions.RequestException as e:
+            return True, [f"Request failed: {e}"] # Treat as missing if request fails
 
-    def check_for_hotlinked_resources(self, soup):
-        hotlinks = 0
-        for tag in soup.find_all(['img', 'link']):
+    def check_for_hotlinked_resources(self, soup, base_url):
+        """Detects if resources are hotlinked from suspicious external domains."""
+        suspicious_hotlinks = 0
+        parsed_base_url = urlparse(base_url)
+        
+        for tag in soup.find_all(['img', 'script', 'link']):
             src = tag.get('src') or tag.get('href')
-            if src and any(trusted in src for trusted in ['google.com', 'facebook.com', 'microsoft.com']):
-                hotlinks += 1
-        return hotlinks > 2
+            if src:
+                # Resolve relative URLs
+                full_src = urljoin(base_url, src)
+                parsed_src = urlparse(full_src)
+
+                # Check if the resource is from a different domain
+                if parsed_src.netloc and parsed_src.netloc != parsed_base_url.netloc:
+                    # Look for known suspicious patterns in external domains
+                    if any(susp_domain in parsed_src.netloc for susp_domain in ['bit.ly', 'tinyurl.com', 'goo.gl']):
+                        suspicious_hotlinks += 1
+                    # Or if it's external and not a common CDN/analytics (e.g., not googleapis, cdnjs, etc.)
+                    # This check needs to be very carefully tuned to avoid false positives
+                    # For simplicity, current version focuses on very short-link domains
+        
+        return suspicious_hotlinks > 0, f"{suspicious_hotlinks} suspicious external resources"
 
     def check_forms(self, soup, url):
+        """Checks forms for suspicious attributes like HTTP actions or sensitive fields."""
         forms = soup.find_all('form')
-        suspicious_forms = 0
-        for form in forms:
+        suspicious_forms = []
+        parsed_base_url = urlparse(url)
+
+        for i, form in enumerate(forms):
+            form_suspicion = []
             action = form.get('action')
-            if action and not action.startswith('https'):
-                suspicious_forms += 1
-            if any(field.get('name') in ['card', 'cc', 'cvv', 'password'] for field in form.find_all(['input', 'textarea'])):
-                suspicious_forms += 1
-        return suspicious_forms
+            
+            # 1. Action attribute is HTTP or points to a different domain (excluding common external services)
+            if action:
+                parsed_action = urlparse(urljoin(url, action))
+                if parsed_action.scheme == 'http' and parsed_action.netloc != parsed_base_url.netloc:
+                    form_suspicion.append("Action uses HTTP scheme and points off-site")
+                elif parsed_action.netloc and parsed_action.netloc != parsed_base_url.netloc and \
+                     not any(known_safe_domain in parsed_action.netloc for known_safe_domain in ['stripe.com', 'paypal.com', 'google.com/forms']):
+                    form_suspicion.append("Action points to an external, potentially untrusted domain")
+
+            # 2. Contains sensitive input fields
+            if any(field.get('name') in ['cardnumber', 'cc', 'cvv', 'password', 'socialsecurity', 'bankaccount'] for field in form.find_all(['input', 'textarea'])):
+                form_suspicion.append("Contains sensitive input fields (e.g., credit card, password)")
+            
+            if form_suspicion:
+                suspicious_forms.append(f"Form {i+1}: {'; '.join(form_suspicion)}")
+        
+        return len(suspicious_forms) > 0, suspicious_forms
+
+    def check_minimal_content(self, html_content):
+        """Checks if the website has very little text content."""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        text = soup.get_text(separator=' ', strip=True)
+        word_count = len(text.split())
+        if word_count < 100: # Increased threshold for "minimal"
+            return True, f"Minimal content detected (Word count: {word_count})"
+        return False, f"Sufficient content (Word count: {word_count})"
 
     def check_blacklists(self, url):
-        # Placeholder (you can integrate VirusTotal, PhishTank etc.)
-        # For now, just simulate as safe
-        return False
+        """Placeholder for actual blacklist checks (e.g., Google Safe Browse API, PhishTank)."""
+        # In a real application, you'd integrate with external APIs here.
+        # Example: Using requests to query a blacklist API.
+        # For demonstration, it's a placeholder.
+        # For Google Safe Browse, you would need an API key.
+        # response = requests.post(f"https://safeBrowse.googleapis.com/v4/threatMatches:find?key={YOUR_GSB_API_KEY}", json={...})
+        return False, "No match found (mocked)"
 
     def analyze_content_with_ai(self, text):
+        """Analyzes content using AI for scam/phishing indicators."""
+        if not text or len(text.split()) < 50: # More robust check for minimal content before AI analysis
+            return "no content to analyze", "No substantial content to analyze."
+
         prompt = f"""
-Analyze this website content and determine if it shows signs of being a scam or phishing website. 
-Flag if there is urgency, login prompts, or poor grammar. Answer just 'safe', 'suspicious', or 'fraudulent'.
+Analyze the following website content for signs of being a scam, phishing, or otherwise untrustworthy website.
+Look for:
+- **Urgency or threats:** Phrases like "Action Required Now," "Your account will be suspended," "Limited time offer."
+- **Requests for sensitive information:** Prompts for passwords, credit card numbers, SSN, bank details outside of a secure, expected context.
+- **Poor grammar, spelling, or awkward phrasing.**
+- **Mismatched branding or impersonation attempts.**
+- **Unusual login prompts or unexpected pop-ups.**
+- **Promises of unrealistic returns or lottery wins.**
+
+Based on these indicators, categorize the content as 'safe', 'suspicious', or 'fraudulent'. Provide only one of these words as your answer.
 
 Content:
-{text[:2000]}
+{text[:4000]}
 """
         try:
             result = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}]
             )
-            decision = result.choices[0].message.content.lower()
-            if "fraud" in decision:
-                return "fraudulent"
+            decision = result.choices[0].message.content.strip().lower()
+            if "fraudulent" in decision:
+                return "fraudulent", "AI classified as fraudulent."
             elif "suspicious" in decision:
-                return "suspicious"
-            return "safe"
-        except:
-            return "safe"
+                return "suspicious", "AI classified as suspicious."
+            return "safe", "AI classified as safe."
+        except openai.APICallError as e:
+            print(f"OpenAI API error: {e}")
+            return "error", f"AI analysis failed due to API error: {e.code}"
+        except Exception as e:
+            print(f"AI analysis general error: {e}")
+            return "error", f"AI analysis failed: {e}"
+
+    def check_dns_valid(self, url):
+        """Checks for valid DNS A records for the domain."""
+        try:
+            domain = urlparse(url).netloc
+            if domain.startswith("www."):
+                domain = domain[4:]
+            
+            # Attempt to resolve the domain
+            answers = dns.resolver.resolve(domain, 'A')
+            return True, f"DNS A record found: {', '.join([str(rdata) for rdata in answers])}"
+        except dns.resolver.NXDOMAIN:
+            return False, "DNS lookup failed: Domain does not exist (NXDOMAIN)"
+        except dns.resolver.NoAnswer:
+            return False, "DNS lookup failed: No A record found"
+        except dns.resolver.LifetimeTimeout:
+            return False, "DNS lookup timed out"
+        except Exception as e:
+            return False, f"DNS check error: {e}"
+
+    def check_javascript_behavior(self, html):
+        """Analyzes JavaScript for common suspicious patterns."""
+        suspicious_js_patterns = []
+
+        # Keywords for obfuscation/dynamic code execution
+        if re.search(r'eval\(|unescape\(|document\.write\(|atob\(|setTimeout\(["\']\s*[^"\']+\s*["\']\s*,', html, re.IGNORECASE):
+            suspicious_js_patterns.append("Obfuscated or dynamically executed JS")
+        
+        # Redirection attempts
+        if re.search(r'window\.location\.replace|window\.location\.assign|window\.location\.href\s*=|document\.location\.href\s*=', html, re.IGNORECASE):
+            suspicious_js_patterns.append("Direct page redirection via JS")
+
+        # Pop-up attempts (simple)
+        if re.search(r'window\.open\(|alert\(', html, re.IGNORECASE): # alert is less suspicious, but open can be.
+            suspicious_js_patterns.append("Pop-up generation via JS (window.open)")
+        
+        # Excessive event listeners that might prevent closing or normal navigation
+        if html.count('onbeforeunload') > 0 or html.count('onunload') > 0:
+            suspicious_js_patterns.append("Unload/beforeunload event listeners")
+
+        return len(suspicious_js_patterns) > 0, suspicious_js_patterns
 
     def summarize(self, url):
-        url = url.strip()  
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-        except requests.RequestException as e:
-            return f"❌ Failed to fetch website: {e}", ""
+        """Summarizes the website and performs fraud analysis."""
+        normalized_url = self._normalize_url(url)
+        
+        # Fetch HTML first, as many checks depend on it
+        html = self.fetch_html_selenium(normalized_url)
+        if not html:
+            return "❌ Failed to fetch website content.", "🚨 **Analysis Aborted:** Could not retrieve website content. It might be down, blocked, or non-existent."
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(html, 'html.parser')
         text = soup.get_text(separator=' ', strip=True)
-        trimmed_text = text[:4000]
+        trimmed_text = text[:4000] # Limit text sent to AI
 
-        # ---------------------
-        # GPT Summary
-        # ---------------------
-        prompt = f"Summarize the following website content:\n\n{trimmed_text}"
+        # --- Parallelize some checks for faster execution ---
+        futures = {
+            self.executor.submit(self.check_ssl, normalized_url): "ssl",
+            self.executor.submit(self.check_domain_age, normalized_url): "domain_age",
+            self.executor.submit(self.is_url_suspicious, normalized_url): "suspicious_url",
+            self.executor.submit(self.check_redirects, normalized_url): "redirects",
+            self.executor.submit(self.check_security_headers, normalized_url): "security_headers",
+            self.executor.submit(self.check_forms, soup, normalized_url): "forms",
+            self.executor.submit(self.check_minimal_content, html): "minimal_content",
+            self.executor.submit(self.check_dns_valid, normalized_url): "dns_valid",
+            self.executor.submit(self.check_javascript_behavior, html): "js_behavior",
+            self.executor.submit(self.check_for_hotlinked_resources, soup, normalized_url): "hotlinking",
+            self.executor.submit(self.analyze_content_with_ai, trimmed_text): "ai_content_analysis",
+            self.executor.submit(self.check_blacklists, normalized_url): "blacklists", # Still a placeholder
+            # self.executor.submit(self.check_virustotal_or_trivy, normalized_url): "virustotal", # This would be a real API call
+        }
+
+        results = {}
+        for future in futures:
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                print(f"Error getting result for {key}: {e}")
+                results[key] = (False, f"Check failed: {e}") # Default to failed if check errors
+
+        # Assign results to variables
+        ssl_valid, ssl_msg = results["ssl"]
+        domain_age, domain_age_msg = results["domain_age"]
+        suspicious_url, suspicious_url_reasons = results["suspicious_url"]
+        redirections, redirects_msg = results["redirects"]
+        header_issues, header_missing_list = results["security_headers"]
+        forms_suspicious, forms_suspicion_list = results["forms"]
+        minimal_content, minimal_content_msg = results["minimal_content"]
+        dns_valid, dns_msg = results["dns_valid"]
+        js_behavior_suspicious, js_behavior_reasons = results["js_behavior"]
+        hotlinking_suspicious, hotlinking_msg = results["hotlinking"]
+        content_ai_classification, content_ai_msg = results["ai_content_analysis"]
+        blacklist_flag, blacklist_msg = results["blacklists"]
+
+        # --- Generate Summary from AI ---
+        summary = "❌ Unable to summarize content."
         try:
-            chat_response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            summary = chat_response.choices[0].message.content.strip()
+            if trimmed_text and len(trimmed_text.split()) > 50:
+                chat_response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": f"Summarize the following website content:\n\n{trimmed_text}"}]
+                )
+                summary = chat_response.choices[0].message.content.strip()
+            else:
+                summary = "Minimal or no discernible content to summarize."
+        except openai.APICallError as e:
+            summary = f"❌ Error summarizing content (API Error: {e.code})."
         except Exception as e:
-            summary = f"❌ OpenAI API error: {e}"
+            summary = f"❌ Error summarizing content: {e}"
 
         # ---------------------
-        # FRAUD CHECKS
+        # FRAUD SCORING & VERDICT
         # ---------------------
-
         score = 0
-        ssl_valid = self.check_ssl(url)
-        domain_age = self.check_domain_age(url)
-        suspicious_url = self.is_url_suspicious(url)
-        redirections = self.check_redirects(url)
-        blacklist_flag = self.check_blacklists(url)
-        header_issues = self.check_security_headers(url)
-        hotlinking = self.check_for_hotlinked_resources(soup)
-        form_score = self.check_forms(soup, url)
-        content_status = self.analyze_content_with_ai(trimmed_text)
 
-        if ssl_valid: score += 1
-        if domain_age > 6: score += 1
-        if not suspicious_url: score += 1
-        if not redirections: score += 1
-        if not blacklist_flag: score += 2
-        if content_status == "safe": score += 2
-        if not hotlinking: score += 1
-        if form_score == 0: score += 1
-        if len(header_issues) <= 1: score += 1
+        # SSL Valid: +2 if True (critical), -2 if False
+        ssl_status = f"❌ False ({ssl_msg})"
+        if ssl_valid:
+            score += 2
+            ssl_status = f"✅ True ({ssl_msg})"
+        else:
+            score -= 2
 
-        if score >= 6:
+        # Domain Age: +1 if > 12 months, +0.5 if > 6 months, -1 if error or very new
+        domain_age_status = f"❌ {domain_age_msg}"
+        if domain_age > 12:
+            score += 1
+            domain_age_status = f"✅ {domain_age_msg}"
+        elif domain_age > 6:
+            score += 0.5
+            domain_age_status = f"⚠️ {domain_age_msg}"
+        else: # Covers 0 months and cases where age couldn't be determined due to error
+            score -= 1
+            domain_age_status = f"❌ {domain_age_msg}" # Keep the original error message for clarity
+            
+        # Suspicious URL Pattern: +2 if False (critical), -2 if True
+        suspicious_url_status = "✅ False"
+        if suspicious_url:
+            score -= 2 # Penalize heavily
+            suspicious_url_status = f"❌ True (Reasons: {'; '.join(suspicious_url_reasons)})"
+        else:
+            score += 2
+
+        # Redirects >= 3: +1 if False, -1 if True
+        redirects_status = f"✅ False ({redirects_msg})"
+        if redirections:
+            score -= 1 # Small penalty
+            redirects_status = f"❌ True ({redirects_msg})"
+        else:
+            score += 1
+
+        # Blacklisted: -3 if True (very critical), +1 if False
+        blacklist_status = f"✅ False ({blacklist_msg})" # Placeholder, so always false unless real API
+        if blacklist_flag:
+            score -= 3
+            blacklist_status = f"❌ True ({blacklist_msg})"
+        else:
+            score += 1 # Small positive for not being blacklisted
+
+        # Content Classification:
+        content_classification_status = f"ℹ️ {content_ai_msg}"
+        if content_ai_classification == "safe":
+            score += 3
+            content_classification_status = f"✅ safe ({content_ai_msg})"
+        elif content_ai_classification == "suspicious":
+            score -= 1
+            content_classification_status = f"⚠️ suspicious ({content_ai_msg})"
+        elif content_ai_classification == "fraudulent":
+            score -= 4 # High penalty
+            content_classification_status = f"❌ fraudulent ({content_ai_msg})"
+        elif content_ai_classification == "no content to analyze":
+            score -= 2 # Penalty for not being able to analyze content
+            content_classification_status = f"❌ No substantial content to analyze."
+        else: # error
+            score -= 1
+            content_classification_status = f"⚠️ AI analysis error: {content_ai_msg}"
+
+        # Hotlinked Resources: +1 if False, -1 if True
+        hotlinking_status = f"✅ False ({hotlinking_msg})"
+        if hotlinking_suspicious:
+            score -= 1
+            hotlinking_status = f"❌ True ({hotlinking_msg})"
+        else:
+            score += 1
+
+        # Suspicious Forms Detected: +1 if 0, -2 if 1+, -3 if many
+        form_status = f"✅ 0 ({'No suspicious forms' if not forms_suspicious else ''})"
+        if forms_suspicious:
+            score -= 2 # Initial penalty
+            if len(forms_suspicion_list) > 1:
+                score -= 1 # Additional penalty for multiple suspicious forms
+            form_status = f"❌ {len(forms_suspicion_list)} suspicious forms detected: {'; '.join(forms_suspicion_list)}"
+        else:
+            score += 1
+
+        # Missing Headers: +1 if 0 missing, -1 if 1-2 missing, -2 if > 2 missing
+        header_status = "✅ None missing"
+        if header_issues:
+            if len(header_missing_list) <= 2:
+                score -= 1
+                header_status = f"⚠️ {', '.join(header_missing_list)} missing"
+            else:
+                score -= 2
+                header_status = f"❌ {', '.join(header_missing_list)} missing"
+        else:
+            score += 1
+
+        # DNS Valid: +1 if True, -2 if False
+        dns_status = f"✅ True ({dns_msg})"
+        if not dns_valid:
+            score -= 2 # Penalty for invalid DNS
+            dns_status = f"❌ False ({dns_msg})"
+        else:
+            score += 1
+            
+        # JS Behavior Suspicious: +1 if False, -1 if True
+        js_behavior_status = f"✅ False ({'No suspicious JS behavior' if not js_behavior_suspicious else ''})"
+        if js_behavior_suspicious:
+            score -= 1 # Smaller penalty for general JS, unless highly critical patterns
+            js_behavior_status = f"⚠️ True (Patterns: {'; '.join(js_behavior_reasons)})"
+        else:
+            score += 1
+
+        # Minimal Content: +1 if False, -2 if True
+        minimal_content_status = f"✅ False ({minimal_content_msg})"
+        if minimal_content:
+            score -= 2
+            minimal_content_status = f"❌ True ({minimal_content_msg})"
+        else:
+            score += 1
+
+
+        # Adjust verdict thresholds based on desired sensitivity
+        # Max possible score with current weights would be 14 (2+1+2+1+1+3+1+1+1+1+1+1)
+        if score >= 9:
             verdict = "Likely Safe ✅"
-        elif score >= 3:
+        elif score >= 4: # Lowered suspicious threshold to accommodate expected score of 4
             verdict = "Suspicious ⚠️"
         else:
             verdict = "Likely Fraudulent ❌"
@@ -207,20 +562,24 @@ Content:
         report = f"""
 ### 🔍 Fraud Check Report
 
-**SSL Valid:** {ssl_valid}  
-**Domain Age:** {domain_age} months  
-**Suspicious URL Pattern:** {suspicious_url}  
-**Redirects >= 3:** {redirections}  
-**Blacklisted:** {blacklist_flag}  
-**Content Classification:** {content_status}  
-**Hotlinked Resources:** {hotlinking}  
-**Suspicious Forms Detected:** {form_score}  
-**Missing Headers:** {", ".join(header_issues)}  
+- **SSL Valid:** {ssl_status}
+- **Domain Age:** {domain_age_status}
+- **Suspicious URL Pattern:** {suspicious_url_status}
+- **Excessive Redirects (>=3):** {redirects_status}
+- **Blacklisted:** {blacklist_status}
+- **Content Classification (AI):** {content_classification_status}
+- **Suspicious External Resources (Hotlinking):** {hotlinking_status}
+- **Suspicious Forms Detected:** {form_status}
+- **Missing Security Headers:** {header_status}
+- **DNS Valid:** {dns_status}
+- **Suspicious JavaScript Behavior:** {js_behavior_status}
+- **Minimal Content Detected:** {minimal_content_status}
 
-**🛡 Final Score:** {score}/10  
-**🚦 Verdict:** **{verdict}**
+---
+
+🛡 Final Score: {score:.1f} (Higher is safer)
+🚦 Verdict: **{verdict}**
 """
-
         return summary, report
 
 # -------------------------------
@@ -231,13 +590,13 @@ summarizer = WebsiteSummarizer()
 
 iface = gr.Interface(
     fn=summarizer.summarize,
-    inputs=gr.Textbox(label="Website URL"),
+    inputs=gr.Textbox(label="Website URL", placeholder="e.g., https://www.example.com or example.com"),
     outputs=[
         gr.Markdown(label="📝 Website Summary"),
         gr.Markdown(label="🔍 Fraud Analysis Report")
     ],
     title="🌐 Website Summary & Fraud Checker",
-    description="Enter a website URL to generate a summary using GPT and scan for common fraud indicators."
+    description="Enter a website URL to summarize and detect possible fraud indicators, including SSL, domain age, DNS, JavaScript behavior, content analysis, and more. This tool uses AI and various heuristics for detection."
 )
 
 iface.launch()
