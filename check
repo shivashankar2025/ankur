@@ -1,9 +1,13 @@
+
+
+
 import os
 import re
 import ssl
 import socket
 import whois
 import requests
+import json
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
@@ -12,16 +16,16 @@ import openai
 import gradio as gr
 import time
 import dns.resolver
-
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from dateutil import parser
 from concurrent.futures import ThreadPoolExecutor
 
-# Trusted Certificate Authorities
+# Trusted Certificate Authorities - Expanded List for better coverage
 TRUSTED_CAS = [
     "DigiCert", "GlobalSign", "Sectigo", "Entrust", "Let's Encrypt",
-    "GoDaddy", "Thawte", "Google Trust Services", "Amazon Trust Services"
+    "GoDaddy", "Thawte", "Google Trust Services", "Amazon Trust Services",
+    "Cloudflare Inc ECC CA", "ISRGDV", "Apple Inc.", "Microsoft Corporation"
 ]
 
 # -------------------------------
@@ -29,30 +33,89 @@ TRUSTED_CAS = [
 # -------------------------------
 
 load_dotenv(override=True)
-api_key = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_SAFE_Browse_API_KEY = os.getenv("GOOGLE_SAFE_Browse_API_KEY")
 
-# Check if API key is loaded
-if not api_key:
-    raise ValueError("OPENAI_API_KEY environment variable not set.")
+# Check if API keys are loaded
+if not OPENAI_API_KEY:
+    print("WARNING: OPENAI_API_KEY environment variable not set. AI content analysis will be skipped.")
+if not GOOGLE_SAFE_Browse_API_KEY:
+    print("WARNING: GOOGLE_SAFE_Browse_API_KEY not set. Safe Browse checks will be skipped.")
 
-client = openai.OpenAI(api_key=api_key)
+# Initialize OpenAI client only if API key is available
+client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # -------------------------------
-# WEBSITE SUMMARIZER CLASS
+# WEBSITE ANALYZER CLASS
 # -------------------------------
 
 class WebsiteSummarizer:
     def __init__(self, model="gpt-4o"):
         self.client = client
         self.model = model
-        self.executor = ThreadPoolExecutor(max_workers=5)
+        self.executor = ThreadPoolExecutor(max_workers=8)
+
+        # EXPANDED TRUSTED DOMAINS FOR EXTERNAL RESOURCES
+        self.TRUSTED_DOMAINS = [
+            'google.com', 'facebook.com', 'amazon.com', 'microsoft.com',
+            'apple.com', 'wikipedia.org', 'twitter.com', 'instagram.com', 'linkedin.com',
+            'netflix.com', 'reddit.com', 'bing.com', 'yahoo.com', 'ebay.com',
+            'cloudflare.com', 'akamai.net', 'bootstrapcdn.com', # Common CDNs/infra
+            'googlesyndication.com', 'gstatic.com', 'doubleclick.net', # Google services
+            'googleusercontent.com', 'vimeo.com', 'youtube.com', 'ytimg.com', # Video platforms and assets
+            'cdn.jsdelivr.net', 'cdnjs.cloudflare.com', 'fonts.googleapis.com', # More common CDNs
+            'ajax.googleapis.com', 's.w.org', 'wp.com', # WordPress related
+            'm.stripe.com', 'js.stripe.com', # Payment processors
+            'assets.braintreegateway.com', # More payment related
+            'platform.twitter.com', 'connect.facebook.net', 'google-analytics.com', # Social/Analytics
+            'googletagmanager.com', 'adobedtm.com', 'assets.adobedtm.com', # Tag managers / Adobe
+            'fonts.gstatic.com', 'gravatar.com', 'secure.gravatar.com', # Fonts and avatars
+            'unpkg.com', 'jsdelivr.net', # Package CDNs
+            'code.jquery.com', # jQuery CDN
+            'cdn.shopify.com', # Shopify CDN
+            'cdninstagram.com', # Instagram CDN
+            'sentry-cdn.com', # Sentry error tracking
+            'cdn.sstatic.net', # Stack Exchange CDN
+            'github.githubassets.com', # GitHub's own assets
+            'images.ctfassets.net', # Contentful CDN (used by GitHub for some images)
+            'avatars.githubusercontent.com', # GitHub user avatars
+            'github-cloud.s3.amazonaws.com', # GitHub assets on S3
+            'cdn.fontawesome.com', # FontAwesome CDN
+            'cdn.segment.com', # Segment CDN
+            'use.typekit.net', # Adobe Typekit
+            'kit.fontawesome.com', # FontAwesome Kit
+            'cdn.cookielaw.org', # Cookie consent platforms
+            'cdn.ampproject.org', # AMP Project CDN
+            'www.googletagmanager.com', # Google Tag Manager
+            'www.google-analytics.com', # Google Analytics
+            'www.recaptcha.net', # reCAPTCHA
+            'www.gstatic.com', # Google static content
+            'maps.gstatic.com', # Google Maps static content
+            'apis.google.com', # Google APIs
+            'ajax.aspnetcdn.com', # Microsoft ASP.NET CDN
+            'az416426.vo.msecnd.net', # Microsoft CDN
+            'w.soundcloud.com', # SoundCloud
+            'widgets.pinterest.com', # Pinterest
+            'code.highcharts.com', # Highcharts CDN
+            'stats.g.doubleclick.net', # Google Analytics
+            'www.googletagservices.com', # Google Ad Services
+            'www.youtube.com', 'i.ytimg.com', # YouTube
+            's.ytimg.com', 'player.vimeo.com', # YouTube/Vimeo players
+            'graph.facebook.com', 'static.addtoany.com', # Social Share
+            'cdn.polyfill.io', # Polyfill CDN
+            'd3js.org', 'cdnjs.com', # D3.js, another CDN
+            'www.google.com' # Google itself
+        ]
+        self.google_safe_Browse_api_key = GOOGLE_SAFE_Browse_API_KEY
 
     def _normalize_url(self, url):
+        """Ensures the URL has a scheme for consistent parsing."""
         if not re.match(r'^[a-zA-Z]+://', url):
             url = 'https://' + url
         return url
 
     def fetch_html_selenium(self, url):
+        """Fetches HTML content using Selenium for dynamic content."""
         options = Options()
         options.add_argument("--headless=new")
         options.add_argument("--disable-gpu")
@@ -62,80 +125,565 @@ class WebsiteSummarizer:
         options.add_argument("--start-maximized")
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-browser-side-navigation")
-        options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-extensions")
         options.add_argument("--blink-settings=imagesEnabled=false")
+        options.add_argument("--log-level=3")
 
         driver = None
         try:
             driver = webdriver.Chrome(options=options)
             driver.set_page_load_timeout(30)
             driver.get(url)
-            time.sleep(5)
+            time.sleep(3)
             html = driver.page_source
             return html
         except Exception as e:
-            print(f"Selenium fetch error for {url}: {e}")
+            # print(f"Selenium fetch error for {url}: {e}") # Debugging
             return None
         finally:
             if driver:
                 driver.quit()
 
     def check_ssl(self, url):
+        """
+        Checks SSL certificate validity, issuer, and expiry.
+        Returns (True, message) if valid, (False, message) otherwise.
+        """
         try:
             parsed = urlparse(url)
             hostname = parsed.hostname
+            if not hostname:
+                return False, "Invalid URL hostname for SSL check."
+
             if ':' in hostname:
                 hostname = hostname.split(':')[0]
+
             ctx = ssl.create_default_context()
             with ctx.wrap_socket(socket.socket(), server_hostname=hostname) as s:
-                s.settimeout(5)
+                s.settimeout(10)
                 s.connect((hostname, 443))
                 cert = s.getpeercert()
 
-            issuer = dict(x[0] for x in cert['issuer'])
-            org = issuer.get('O', 'Unknown')
-            trusted = any(ca.lower() in org.lower() for ca in TRUSTED_CAS)
+            issuer_info = {}
+            for item in cert['issuer']:
+                for k, v in item:
+                    issuer_info[k] = v
+            issuer_org = issuer_info.get('organizationName', 'Unknown')
+            issuer_cn = issuer_info.get('commonName', 'Unknown')
+            
+            trusted = any(ca.lower() in issuer_org.lower() or ca.lower() in issuer_cn.lower() for ca in TRUSTED_CAS)
 
-            expiry_date = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+            expiry_date_str = cert.get('notAfter')
+            if not expiry_date_str:
+                return False, "SSL certificate expiry date not found."
+            
+            expiry_date = datetime.strptime(expiry_date_str, '%b %d %H:%M:%S %Y %Z')
             days_left = (expiry_date - datetime.utcnow()).days
 
             if days_left < 0:
-                return False, f"Expired SSL certificate from {org} (expired {abs(days_left)} days ago)"
+                return False, f"Expired SSL certificate (expired {abs(days_left)} days ago). **HIGH RISK**"
             if not trusted:
-                return False, f"Untrusted CA: {org}"
-            return True, f"Valid certificate from {org}, expires in {days_left} days"
+                return False, f"Untrusted SSL certificate issuer: {issuer_org}. **MODERATE RISK**"
+            if days_left < 30:
+                return True, f"Valid SSL from {issuer_org}, but expires soon ({days_left} days). **LOW RISK**"
+            
+            return True, f"Valid SSL from {issuer_org}, expires in {days_left} days."
+        except ssl.SSLError as e:
+            return False, f"SSL/TLS error: {e}"
+        except socket.timeout:
+            return False, "SSL/TLS connection timed out."
+        except socket.error as e:
+            return False, f"Socket error during SSL check: {e}"
         except Exception as e:
-            return False, f"SSL check failed: {e}"
+            return False, f"General SSL check failed: {e}"
 
-    def check_domain_age(self, url):
+    def is_url_suspicious(self, url):
+        """
+        Checks for suspicious patterns in the URL.
+        Returns (True, message) if suspicious, (False, message) otherwise.
+        """
+        parsed = urlparse(url)
+        suspicion_points = 0
+        reasons = []
+
+        if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", parsed.hostname or ""):
+            suspicion_points += 2
+            reasons.append("IP address used instead of domain name.")
+        
+        if re.search(r"(login|verify|secure|update|bank|paypal|account|support|admin|signin)", parsed.hostname or "", re.IGNORECASE):
+            suspicion_points += 1
+            reasons.append("Suspicious keyword in domain.")
+        
+        if parsed.hostname and parsed.hostname.count('.') > 3 and not any(sub in parsed.hostname for sub in ['.co.uk', '.com.au', '.net.au', '.gov.uk', '.org.uk', '.co.in', 'cloudfront.net', 's3.amazonaws.com', 'azureedge.net']): # Exclude common legitimate subdomains
+            suspicion_points += 0.5
+            reasons.append("Excessive subdomains.")
+            
+        if len(url) > 75:
+            suspicion_points += 0.5
+            reasons.append("Very long URL.")
+
+        path_segments = parsed.path.split('/')
+        for segment in path_segments:
+            if re.match(r"^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?$", segment):
+                if segment.lower() != parsed.hostname.lower() and segment.replace("www.", "").lower() != parsed.hostname.replace("www.", "").lower():
+                    suspicion_points += 2
+                    reasons.append(f"Mismatched domain '{segment}' in URL path.")
+                    break
+
+        if suspicion_points >= 2:
+            return True, f"Suspicious URL patterns detected: {', '.join(reasons)}. **MODERATE RISK**"
+        return False, "URL appears clean."
+
+    def check_redirects(self, url):
+        """
+        Checks for excessive redirects, which can be a sign of obfuscation.
+        Returns (True, message) if suspicious, (False, message) otherwise.
+        """
         try:
-            domain = urlparse(url).netloc or urlparse(url).path
-            if domain.startswith("www."):
-                domain = domain[4:]
-            w = whois.whois(domain)
-            creation_date = w.creation_date
-            if isinstance(creation_date, list):
-                creation_date = creation_date[0]
-            if not creation_date:
-                return 0, "No creation date found"
-            age = (datetime.utcnow() - creation_date).days // 30
-            return age, f"{age} months"
+            response = requests.head(url, allow_redirects=True, timeout=10)
+            
+            if not response.history and not response.ok:
+                response = requests.get(url, allow_redirects=True, timeout=10)
+            
+            if len(response.history) >= 3:
+                redirect_chain = " -> ".join([r.url for r in response.history] + [response.url])
+                return True, f"Excessive redirects detected ({len(response.history)}). Final URL: {response.url}. **MODERATE RISK**"
+            return False, "No excessive redirects."
+        except requests.exceptions.TooManyRedirects:
+            return True, "Too many redirects (loop detected). **HIGH RISK**"
+        except requests.RequestException as e:
+            return False, f"Redirect check failed: {e}"
+
+    def check_security_headers(self, url):
+        """
+        Checks for critical HTTP security headers.
+        Returns (True, message) if issues, (False, message) otherwise.
+        """
+        try:
+            response = requests.head(url, timeout=10)
+            headers = {k.lower(): v for k, v in response.headers.items()}
+            
+            missing_headers = []
+            if 'x-content-type-options' not in headers or headers['x-content-type-options'].lower() != 'nosniff':
+                missing_headers.append('X-Content-Type-Options: nosniff')
+            if 'strict-transport-security' not in headers:
+                missing_headers.append('Strict-Transport-Security')
+            # Content-Security-Policy is very complex, often missing or partial, lower penalty
+            if 'content-security-policy' not in headers:
+                missing_headers.append('Content-Security-Policy')
+            if 'x-frame-options' not in headers or headers['x-frame-options'].lower() not in ['deny', 'sameorigin']:
+                missing_headers.append('X-Frame-Options: DENY/SAMEORIGIN')
+            # Referrer-Policy can be set to different values, so just checking presence
+            if 'referrer-policy' not in headers:
+                 missing_headers.append('Referrer-Policy')
+            
+            if missing_headers:
+                return True, f"Missing or insecure HTTP security headers: {', '.join(missing_headers)}. **LOW RISK**"
+            return False, "All critical HTTP security headers present."
+        except requests.RequestException as e:
+            return False, f"Header check failed: {e}"
+
+    def check_for_hotlinked_resources(self, soup, base_url):
+        """
+        Checks for external resources (images, scripts, stylesheets) linked from suspicious domains.
+        This is a heuristic, not an exhaustive check.
+        Returns (True, message) if suspicious, (False, message) otherwise.
+        """
+        hotlinks_found = []
+        parsed_base_url = urlparse(base_url)
+        base_domain = parsed_base_url.netloc
+
+        for tag_name in ['img', 'script', 'link']:
+            for tag in soup.find_all(tag_name):
+                src_attr = tag.get('src') or tag.get('href')
+                if src_attr:
+                    full_src_url = urljoin(base_url, src_attr)
+                    parsed_src_url = urlparse(full_src_url)
+                    
+                    if parsed_src_url.netloc and parsed_src_url.netloc != base_domain:
+                        # Check if this external domain is in our expanded trusted list
+                        is_trusted_cdn = False
+                        for trusted_domain in self.TRUSTED_DOMAINS:
+                            # Use .endswith() for better matching of subdomains like 'github.githubassets.com'
+                            if parsed_src_url.netloc.endswith(trusted_domain) or parsed_src_url.netloc == trusted_domain:
+                                is_trusted_cdn = True
+                                break
+                        
+                        if not is_trusted_cdn:
+                            hotlinks_found.append(f"{tag_name} from {parsed_src_url.netloc}")
+
+        if hotlinks_found:
+            return True, f"Suspicious external resources detected: {'; '.join(hotlinks_found)}. **LOW RISK**"
+        return False, "No suspicious external resources detected."
+
+    def check_forms(self, soup, base_url):
+        """
+        Checks for suspicious forms (e.g., non-HTTPS action, sensitive fields).
+        Returns (count, message).
+        """
+        forms = soup.find_all('form')
+        suspicious_forms_count = 0
+        reasons = []
+
+        for i, form in enumerate(forms):
+            form_suspicious = False
+            action = form.get('action')
+            
+            # IMPROVED: Only flag if action explicitly points to HTTP on an HTTPS page
+            # Ignore empty action or relative actions which are common for JS-driven forms
+            if base_url.startswith('https://') and action and action.startswith('http://'):
+                form_suspicious = True
+                reasons.append(f"Form {i+1} action points to insecure HTTP ({action}).")
+            
+            # Check for sensitive input fields
+            sensitive_fields = ['password', 'creditcard', 'cc_number', 'cvv', 'bank_account', 'social_security', 'ssn']
+            for field in form.find_all(['input', 'textarea']):
+                field_name = field.get('name', '').lower()
+                field_type = field.get('type', '').lower()
+                if any(sf in field_name for sf in sensitive_fields) or \
+                   (field_type == 'password') or \
+                   (field_type == 'text' and any(sf in field_name for sf in ['card', 'cc', 'cvv'])):
+                    # Check if the form is actually submitting.
+                    # This is still a heuristic, as JS can prevent default submission.
+                    # For a truly accurate check, network traffic analysis would be needed.
+                    if action or form.find('button', {'type': 'submit'}) or form.find('input', {'type': 'submit'}):
+                        form_suspicious = True
+                        reasons.append(f"Form {i+1} contains sensitive input fields ({field_name}).")
+                        break
+
+            if form_suspicious:
+                suspicious_forms_count += 1
+        
+        if suspicious_forms_count > 0:
+            return suspicious_forms_count, f"{suspicious_forms_count} suspicious form(s) found: {'; '.join(reasons)}. **HIGH RISK**"
+        return 0, "No suspicious forms detected."
+
+    def check_blacklists(self, url):
+        """
+        Placeholder for external blacklist checks.
+        Returns (True, message) if blacklisted, (False, message) otherwise.
+        """
+        known_bad_domains = ["phishing.example.com", "malware.test.net"]
+        parsed_url = urlparse(url)
+        if parsed_url.hostname in known_bad_domains:
+            return True, "Found on internal dummy blacklist. **CRITICAL RISK**"
+
+        return False, "Not found on simple blacklists (further checks recommended)."
+
+    def check_google_safe_Browse(self, url):
+        """
+        Checks a URL against the Google Safe Browse API (Lookup API v4).
+        Returns (True, "Reason") if unsafe, (False, "Reason") if safe or API error.
+        """
+        if not self.google_safe_Browse_api_key:
+            return False, "Google Safe Browse API key not configured. Check skipped."
+
+        api_url = f"https://safeBrowse.googleapis.com/v4/threatMatches:find?key={self.google_safe_Browse_api_key}"
+        
+        normalized_url = self._normalize_url(url)
+
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "client": {
+                "clientId": "web-summary-fraud-checker",
+                "clientVersion": "1.0.0"
+            },
+            "threatInfo": {
+                "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+                "platformTypes": ["ANY_PLATFORM"],
+                "threatEntryTypes": ["URL"],
+                "threatEntries": [{"url": normalized_url}]
+            }
+        }
+
+        try:
+            response = requests.post(api_url, headers=headers, json=payload, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+
+            if "matches" in data and data["matches"]:
+                threats = []
+                for match in data["matches"]:
+                    threats.append(f"{match.get('threatType', 'UNKNOWN')}")
+                return True, f"Found on Google Safe Browse list: {', '.join(threats)}. **CRITICAL RISK - AVOID THIS SITE!**"
+            else:
+                return False, "Not found on Google Safe Browse lists."
+
+        except requests.exceptions.HTTPError as e:
+            return False, f"Safe Browse API HTTP error: {e.response.status_code} - {e.response.text}"
+        except requests.exceptions.ConnectionError as e:
+            return False, f"Safe Browse API connection error: {e}"
+        except requests.exceptions.Timeout:
+            return False, "Safe Browse API request timed out."
+        except json.JSONDecodeError:
+            return False, "Safe Browse API returned invalid JSON response."
         except Exception as e:
-            return 0, f"Domain age check failed: {e}"
+            return False, f"An unexpected error occurred during Safe Browse check: {e}"
+
+    def check_minimal_content(self, text):
+        """Checks if the content is too sparse, often a sign of incomplete or malicious sites."""
+        if len(text) < 200:
+            return True, "Minimal content detected. Could be under construction or a placeholder. **LOW RISK**"
+        return False, "Sufficient content detected."
+
+    def analyze_content_with_ai(self, text):
+        """
+        Uses OpenAI to classify content as safe, suspicious, or fraudulent.
+        """
+        if not self.client:
+            return "skipped", "OpenAI API key not configured. AI analysis skipped."
+
+        prompt = f"""
+Analyze the following website content for signs of being a scam or phishing website.
+Look for:
+- Urgency (e.g., "Act now!", "Your account will be suspended!")
+- Financial requests (e.g., "Confirm your bank details", "Claim your prize money")
+- Poor grammar, spelling mistakes, or unprofessional language
+- Login prompts for sensitive information (e.g., banking, email, social media)
+- Mismatched branding or logos
+- Unrealistic offers or claims
+- Requests for personal information (SSN, credit card, etc.)
+
+Based on these indicators, categorize the content as 'safe', 'suspicious', or 'fraudulent'.
+Provide only one of these three words as your direct answer, followed by a brief reason if suspicious/fraudulent.
+
+Content:
+{text[:4000]}
+"""
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100
+            )
+            decision = response.choices[0].message.content.strip().lower()
+
+            if "fraudulent" in decision or "fraud" in decision:
+                return "fraudulent", "AI classified as fraudulent."
+            elif "suspicious" in decision:
+                return "suspicious", "AI classified as suspicious."
+            return "safe", "AI classified as safe."
+        except openai.APIConnectionError as e:
+            return "error", f"OpenAI connection error: {e}"
+        except openai.RateLimitError:
+            return "error", "OpenAI rate limit hit."
+        except openai.APIStatusError as e:
+            return "error", f"OpenAI API error: {e.status_code} - {e.response}"
+        except Exception as e:
+            return "error", f"AI content analysis failed: {e}"
+
+    def check_suspicious_javascript(self, html_content):
+        """
+        Performs a basic check for suspicious JavaScript patterns.
+        This is a heuristic and not a substitute for a real JS sandbox.
+        """
+        suspicious_js_patterns = [
+            r"document\.write\(unescape\(",
+            r"eval\(",
+            r"setTimeout\(\s*['\"]",
+            r"window\.location\.href\s*=\s*['\"`/]",
+            r"history\.pushState",
+            r"atob\(",
+            r"String\.fromCharCode\(",
+            r"\.innerHTML\s*=\s*['\"`]",
+            r"addEventListener\(['\"]click['\"],.*?window\.open",
+            r"form\.submit\(\)",
+        ]
+        
+        reasons = []
+        for pattern in suspicious_js_patterns:
+            if re.search(pattern, html_content, re.IGNORECASE | re.DOTALL):
+                reasons.append(f"Pattern '{pattern}' found.")
+        
+        if reasons:
+            return True, f"Suspicious JavaScript patterns detected: {'; '.join(reasons)}. **MODERATE RISK**"
+        return False, "No highly suspicious JavaScript patterns detected."
+
+
+    def summarize(self, url):
+        """
+        Main method to summarize and perform comprehensive fraud checks on a URL.
+        """
+        normalized_url = self._normalize_url(url)
+        
+        summary = "N/A"
+        detailed_report = ""
+        score = 100
+        final_verdict_line = ""
+
+        html_content = self.fetch_html_selenium(normalized_url)
+
+        if not html_content:
+            summary = "❌ Could not fetch website content using Selenium. The site might be down, blocked, or not exist."
+            score = 10 # Very low score for unreachability
+            final_verdict_line = "Likely Fraudulent ❌"
+
+            # Populate report messages for skipped checks
+            ssl_is_safe, ssl_msg = False, "SSL check skipped (site unreachable)."
+            suspicious_url_flag, suspicious_url_msg = False, "URL pattern check skipped (site unreachable)."
+            redirects_flag, redirects_msg = False, "Redirect check skipped (site unreachable)."
+            headers_issues_flag, headers_msg = False, "Header check skipped (site unreachable)."
+            blacklist_flag, blacklist_msg = False, "Blacklist check skipped (site unreachable)."
+            safe_Browse_unsafe, safe_Browse_msg = False, "Google Safe Browse check skipped (site unreachable)."
+            hotlinking_flag, hotlinking_msg = False, "External resource check skipped (site unreachable)."
+            form_count, form_msg = 0, "Form check skipped (site unreachable)."
+            minimal_content_flag, minimal_content_msg = False, "Minimal content check skipped (site unreachable)."
+            content_ai_status, content_ai_msg = "skipped", "AI analysis skipped (site unreachable)."
+            js_behavior_flag, js_behavior_msg = False, "JavaScript check skipped (site unreachable)."
+
+            detailed_report = f"""
+---
+### Overall Verdict: **{final_verdict_line}** (Score: {max(0, score)}/100)
+---
+### Key Security Indicators:
+- **Website Accessibility:** ❌ Failed to fetch content via Selenium. Site might be down, blocked, or not exist. **CRITICAL RISK**
+- **SSL/TLS Certificate:** {'✅ ' if ssl_is_safe else ('⚠️ ' if ssl_is_safe else '❌ ')}{ssl_msg}
+- **Suspicious URL Pattern:** {'❌ ' if suspicious_url_flag else '✅ '}{suspicious_url_msg}
+- **Excessive Redirects:** {'❌ ' if redirects_flag else '✅ '}{redirects_msg}
+- **Missing HTTP Security Headers:** {'❌ ' if headers_issues_flag else '✅ '}{headers_msg}
+- **Custom Blacklist Check:** {'❌ ' if blacklist_flag else '✅ '}{blacklist_msg}
+- **Google Safe Browse:** {'❌ ' if safe_Browse_unsafe else '✅ '}{safe_Browse_msg}
+- **Suspicious External Resources (Hotlinking):** {'❌ ' if hotlinking_flag else '✅ '}{hotlinking_msg}
+- **Suspicious Forms Detected:** {'❌ ' if form_count > 0 else '✅ '}{form_msg}
+- **Minimal Content Detected:** {'⚠️ ' if minimal_content_flag else '✅ '}{minimal_content_msg}
+- **AI Content Analysis:** {'❌ ' if content_ai_status == "fraudulent" else ('⚠️ ' if content_ai_status == "suspicious" else '✅ ')}{content_ai_msg}
+- **Suspicious JavaScript Behavior:** {'❌ ' if js_behavior_flag else '✅ '}{js_behavior_msg}
+
+---
+"""
+            return summary, detailed_report
+
+        futures = {
+            self.executor.submit(self.check_ssl, normalized_url): "ssl_check",
+            self.executor.submit(self.is_url_suspicious, normalized_url): "suspicious_url",
+            self.executor.submit(self.check_redirects, normalized_url): "redirects",
+            self.executor.submit(self.check_security_headers, normalized_url): "headers",
+            self.executor.submit(self.check_blacklists, normalized_url): "blacklist",
+            self.executor.submit(self.check_google_safe_Browse, normalized_url): "google_safe_Browse",
+        }
+
+        results = {}
+        for future in futures:
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                results[key] = (False, f"Check failed: {e}") 
+        
+        ssl_is_safe, ssl_msg = results["ssl_check"]
+        suspicious_url_flag, suspicious_url_msg = results["suspicious_url"]
+        redirects_flag, redirects_msg = results["redirects"]
+        headers_issues_flag, headers_msg = results["headers"]
+        blacklist_flag, blacklist_msg = results["blacklist"]
+        safe_Browse_unsafe, safe_Browse_msg = results["google_safe_Browse"]
+
+        soup = BeautifulSoup(html_content, 'html.parser')
+        text_content = soup.get_text(separator=' ', strip=True)
+        trimmed_text_content = text_content[:6000]
+
+        hotlinking_flag, hotlinking_msg = self.check_for_hotlinked_resources(soup, normalized_url)
+        form_count, form_msg = self.check_forms(soup, normalized_url)
+        minimal_content_flag, minimal_content_msg = self.check_minimal_content(trimmed_text_content)
+        content_ai_status, content_ai_msg = self.analyze_content_with_ai(trimmed_text_content)
+        js_behavior_flag, js_behavior_msg = self.check_suspicious_javascript(html_content)
+
+        if self.client:
+            try:
+                chat_response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": f"Summarize the following website content:\n\n{trimmed_text_content[:2000]}"}],
+                    max_tokens=300
+                )
+                summary = chat_response.choices[0].message.content.strip()
+            except Exception as e:
+                summary = f"❌ OpenAI API error during summarization: {e}"
+        else:
+            summary = "AI summarization skipped due to missing API key."
+
+        # --- Scoring Logic (for reachable sites) ---
+        score = 100
+
+        if not ssl_is_safe:
+            if "Expired" in ssl_msg:
+                score -= 30
+            elif "Untrusted" in ssl_msg:
+                score -= 25
+            else:
+                score -= 15
+        else:
+            if "expires soon" in ssl_msg:
+                score -= 5
+            else:
+                score += 5 # Reduced bonus for SSL to make other factors weigh more
+
+        if suspicious_url_flag: score -= 20
+        if redirects_flag: score -= 10
+        
+        # REDUCED PENALTY for missing headers, as it's common even for legitimate sites
+        if headers_issues_flag: score -= 3
+        
+        if blacklist_flag: score -= 50
+        if safe_Browse_unsafe: score -= 100
+        
+        # REDUCED PENALTY for hotlinking, as it's very common and often legitimate
+        if hotlinking_flag: score -= 5
+        
+        # Reduced penalty per form as well, due to improved but still heuristic check
+        if form_count > 0: score -= (form_count * 5) # Significantly reduced penalty
+        
+        if minimal_content_flag: score -= 10
+        if js_behavior_flag: score -= 15
+
+        if content_ai_status == "suspicious": score -= 20 # Reduced AI penalty
+        elif content_ai_status == "fraudulent": score -= 60 # Reduced AI penalty
+
+        score = max(0, score)
+
+        if score >= 70: # Adjusted threshold for "Likely Safe"
+            final_verdict_line = "Likely Safe ✅"
+        elif score >= 40: # Adjusted threshold for "Suspicious"
+            final_verdict_line = "Suspicious ⚠️"
+        else:
+            final_verdict_line = "Likely Fraudulent ❌"
+
+        detailed_report = f"""
+---
+### Overall Verdict: **{final_verdict_line}** (Score: {score}/100)
+---
+### Key Security Indicators:
+- **Website Accessibility:** {'✅ ' if html_content else '❌ '}{'Site content fetched successfully.' if html_content else 'Failed to fetch content.'}
+- **SSL/TLS Certificate:** {'✅ ' if ssl_is_safe and "expires soon" not in ssl_msg else ('⚠️ ' if ssl_is_safe else '❌ ')}{ssl_msg}
+- **Suspicious URL Pattern:** {'❌ ' if suspicious_url_flag else '✅ '}{suspicious_url_msg}
+- **Excessive Redirects:** {'❌ ' if redirects_flag else '✅ '}{redirects_msg}
+- **Missing HTTP Security Headers:** {'❌ ' if headers_issues_flag else '✅ '}{headers_msg}
+- **Custom Blacklist Check:** {'❌ ' if blacklist_flag else '✅ '}{blacklist_msg}
+- **Google Safe Browse:** {'❌ ' if safe_Browse_unsafe else '✅ '}{safe_Browse_msg}
+- **Suspicious External Resources (Hotlinking):** {'❌ ' if hotlinking_flag else '✅ '}{hotlinking_msg}
+- **Suspicious Forms Detected:** {'❌ ' if form_count > 0 else '✅ '}{form_msg}
+- **Minimal Content Detected:** {'⚠️ ' if minimal_content_flag else '✅ '}{minimal_content_msg}
+- **AI Content Analysis:** {'❌ ' if content_ai_status == "fraudulent" else ('⚠️ ' if content_ai_status == "suspicious" else '✅ ')}{content_ai_msg}
+- **Suspicious JavaScript Behavior:** {'❌ ' if js_behavior_flag else '✅ '}{js_behavior_msg}
+
+---
+"""
+        return summary, detailed_report
 
 # -------------------------------
-# GRADIO INTERFACE (stub)
+# GRADIO INTERFACE
 # -------------------------------
 
 summarizer = WebsiteSummarizer()
 
 iface = gr.Interface(
-    fn=summarizer.check_ssl,
+    fn=summarizer.summarize,
     inputs=gr.Textbox(label="Website URL", placeholder="e.g., https://www.example.com or example.com"),
-    outputs=gr.Textbox(label="SSL Result"),
-    title="🌐 Website SSL Validator",
-    description="Enter a website URL to check SSL certificate trust and expiry."
+    outputs=[
+        gr.Markdown(label="📝 Website Summary (via AI)"),
+        gr.Markdown(label="🔍 Comprehensive Fraud Analysis Report")
+    ],
+    title="🌐 Website Summary & Fraud Checker",
+    description="Enter a website URL to generate an AI summary and receive a detailed report on potential fraud indicators. **Note: For full functionality, ensure OPENAI_API_KEY and GOOGLE_SAFE_Browse_API_KEY are set as environment variables.**"
 )
 
-iface.launch()
+iface.launch(share=True)
